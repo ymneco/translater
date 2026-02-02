@@ -57,6 +57,45 @@
             font-style: italic;
         }
 
+        /* interim（途中結果）用：薄いプレビュー翻訳枠 */
+        .preview-container {
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .preview-container .subtitle-jp {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 6px;
+            opacity: 0.75;
+        }
+
+        .preview-container .subtitle-en {
+            font-size: 16px;
+            opacity: 0.75;
+        }
+
+        .preview-translation-indicator {
+            color: rgba(255, 200, 120, 0.85);
+            font-size: 11px;
+            text-align: center;
+            margin-bottom: 6px;
+        }
+
+        .final-container.hidden {
+            display: none;
+        }
+
+        .range-value {
+            color: white;
+            width: 3.5em;
+            text-align: right;
+            display: inline-block;
+        }
+
         .controls {
             position: fixed;
             top: 10px;
@@ -173,6 +212,39 @@
             transition: width 0.3s ease;
         }
 
+        /* マイク入力レベルメーター */
+        .level-meter {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+        }
+
+        .level-meter-track {
+            flex: 1;
+            height: 10px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.12);
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .level-meter-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #44ff44, #ffaa00, #ff4444);
+            transform-origin: left;
+            transition: width 0.06s linear;
+        }
+
+        .level-meter-text {
+            width: 4.5em;
+            text-align: right;
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.85);
+            font-variant-numeric: tabular-nums;
+        }
+
         .status {
             color: #90EE90;
             font-size: 12px;
@@ -279,11 +351,21 @@
 
     <div class="container">
         <div class="subtitle-container hidden" id="subtitleContainer">
-            <div class="translation-indicator hidden" id="translationIndicator">Translating...</div>
-            <div class="subtitle-jp" id="subtitleJp"></div>
-            <div class="subtitle-en" id="subtitleEn"></div>
-            <div class="confidence-indicator">
-                <div class="confidence-bar" id="confidenceBar"></div>
+            <!-- interim: preview frame (separate from final) -->
+            <div class="preview-container hidden" id="previewContainer">
+                <div class="preview-translation-indicator hidden" id="previewTranslationIndicator">Preview translating...</div>
+                <div class="subtitle-jp" id="previewJp"></div>
+                <div class="subtitle-en" id="previewEn"></div>
+            </div>
+
+            <!-- final: committed subtitles -->
+            <div class="final-container hidden" id="finalContainer">
+                <div class="translation-indicator hidden" id="translationIndicator">Translating...</div>
+                <div class="subtitle-jp" id="subtitleJp"></div>
+                <div class="subtitle-en" id="subtitleEn"></div>
+                <div class="confidence-indicator">
+                    <div class="confidence-bar" id="confidenceBar"></div>
+                </div>
             </div>
         </div>
     </div>
@@ -303,6 +385,16 @@
                 <option value="default">Default microphone</option>
             </select>
             <button onclick="refreshMicrophones()" class="small-button refresh-button">🔄</button>
+        </div>
+
+        <div class="control-row">
+            <label for="micLevelFill">Input level:</label>
+            <div class="level-meter" aria-label="Microphone input level">
+                <div class="level-meter-track">
+                    <div class="level-meter-fill" id="micLevelFill"></div>
+                </div>
+                <div class="level-meter-text" id="micLevelText">0%</div>
+            </div>
         </div>
 
         <div class="control-row compact-gap">
@@ -363,6 +455,18 @@
         </div>
 
         <div class="control-row">
+            <label for="previewDebounceRange">Preview debounce (ms):</label>
+            <input type="range" id="previewDebounceRange" min="100" max="1000" step="50" value="350">
+            <span id="previewDebounceValue" class="range-value">350</span>
+        </div>
+
+        <div class="control-row">
+            <label for="previewDurationRange">Preview display (sec):</label>
+            <input type="range" id="previewDurationRange" min="1" max="10" value="3">
+            <span id="previewDurationValue" class="range-value">3</span>
+        </div>
+
+        <div class="control-row">
             <label>
                 <input type="checkbox" id="continuousMode" checked> Continuous recognition
             </label>
@@ -392,6 +496,7 @@
 
         // マイク権限の「このページ内での再要求」を避けるためのキャッシュ
         const MIC_PERMISSION_CACHE_KEY = 'micPermissionGranted';
+        const MIC_SELECTED_DEVICE_ID_KEY = 'selectedMicDeviceId';
         let micEverGrantedThisSession = false;
 
         let recognitionRestartTimer = null;
@@ -400,6 +505,24 @@
         // 翻訳（Google Translate APIは任意）
         let translationRequestSeq = 0;
 
+        // interim（途中結果）プレビュー翻訳（別枠）
+        let previewTranslationSeq = 0;
+        let previewDebounceTimer = null;
+        let previewDebounceMs = 350; // adjustable
+
+        // preview 表示持続時間（秒）
+        let previewDisplaySec = 3;
+        let previewHideTimer = null;
+
+        // final（確定）を順序保証で翻訳するキュー
+        let finalTranslateQueue = [];
+        let finalQueueProcessing = false;
+        let finalQueueSessionId = 0; // stop/start で増やして古い処理を無効化
+
+        // 表示キャッシュ（チェックボックス変更時の再描画用）
+        const lastPreview = { jp: '', en: '', confidence: 0.5 };
+        const lastFinal = { jp: '', en: '', confidence: 0.5 };
+
         // マイクのkeep-alive（無音放置でストリームが落ちる環境向け）
         let audioContext = null;
         let keepAliveSourceNode = null;
@@ -407,6 +530,17 @@
         let micWatchdogTimer = null;
         let micRecoveryInProgress = false;
         let micRecoveryDelayMs = 1000;
+
+        // 背景で getUserMedia を呼ぶと、環境によっては定期的に許可ポップアップが出ることがある。
+        // そのため「自動復旧」は行わず、ユーザー操作（Start）でのみ再接続する。
+        let micStreamEndedNotifiedAt = 0;
+
+        // 入力レベルメーター
+        let micLevelSourceNode = null;
+        let micLevelAnalyserNode = null;
+        let micLevelData = null;
+        let micLevelRafId = null;
+        let micLevelSmoothed = 0;
         
         // 学習機能用の変数
         let userVocabulary = new Map(); // ユーザーの語彙データベース
@@ -430,8 +564,10 @@
                 //   - それ以外は「以前に許可済み」のときだけ取得を試す（ポップアップ抑止）
                 const previouslyGranted = localStorage.getItem(MIC_PERMISSION_CACHE_KEY) === 'true';
                 if (hasAnyAudioInput && !hasAnyLabel && !hasLiveStream) {
-                    if (userInitiated || previouslyGranted) {
-                        await getSelectedMicrophone(userInitiated);
+                    // 不要な許可ポップアップを避けるため、自動取得は行わない。
+                    // ユーザーが明示操作したときのみ getUserMedia を呼ぶ。
+                    if (userInitiated) {
+                        await getSelectedMicrophone(true);
                         devices = await navigator.mediaDevices.enumerateDevices();
                     }
                 }
@@ -447,6 +583,15 @@
                     option.textContent = device.label || `Mic ${device.deviceId.substr(0, 8)}`;
                     select.appendChild(option);
                 });
+
+                // 以前選択したマイクを復元（存在する場合のみ）
+                const savedDeviceId = localStorage.getItem(MIC_SELECTED_DEVICE_ID_KEY);
+                if (savedDeviceId) {
+                    const hasOption = Array.from(select.options).some(o => o.value === savedDeviceId);
+                    if (hasOption) {
+                        select.value = savedDeviceId;
+                    }
+                }
                 
                 updateStatus(`Found ${availableMicrophones.length + 1} microphones`);
             } catch (error) {
@@ -480,7 +625,8 @@
                 // - 'prompt' は確実にプロンプトになり得るため停止
                 // - 'unknown' は file:// 等で常に返ることがあるので「以前に許可済み」の場合のみ試す
                 if (!userInitiated) {
-                    if (perm === 'prompt') {
+                    // Permissions API が環境により不安定なため、"以前に許可済み" の場合は取得を試す
+                    if (perm === 'prompt' && !previouslyGranted) {
                         updateStatus('⚠️ Microphone permission is not confirmed, so auto-acquire is stopped. Click Start to grant permission if needed.');
                         return false;
                     }
@@ -517,6 +663,7 @@
                     if (mediaStream) {
                         mediaStream.getTracks().forEach(track => track.stop());
                         mediaStream = null;
+                        disconnectMicLevelMeter();
                     }
 
                     const constraints = {
@@ -531,6 +678,11 @@
 
                     // 可能ならストリームのkeep-aliveを接続（AudioContextはユーザー操作後に有効化されることが多い）
                     tryConnectMicKeepAlive();
+
+                    // ユーザー操作で取得した場合はレベルメーターも接続を試す
+                    if (userInitiated) {
+                        connectMicLevelMeter();
+                    }
                 })();
 
                 await micStreamPromise;
@@ -659,31 +811,86 @@
             }
         }
 
-        async function attemptMicrophoneRecovery() {
-            if (micRecoveryInProgress) return;
-            micRecoveryInProgress = true;
+        function setMicLevelUI(level01) {
+            const fill = document.getElementById('micLevelFill');
+            const text = document.getElementById('micLevelText');
+            const pct = Math.max(0, Math.min(1, Number(level01) || 0));
+            const pct100 = Math.round(pct * 100);
+            if (fill) fill.style.width = pct100 + '%';
+            if (text) text.textContent = pct100 + '%';
+        }
+
+        function disconnectMicLevelMeter() {
+            if (micLevelRafId) {
+                cancelAnimationFrame(micLevelRafId);
+                micLevelRafId = null;
+            }
+            micLevelData = null;
+            micLevelSmoothed = 0;
+
+            if (micLevelSourceNode) {
+                try { micLevelSourceNode.disconnect(); } catch {}
+                micLevelSourceNode = null;
+            }
+            if (micLevelAnalyserNode) {
+                try { micLevelAnalyserNode.disconnect(); } catch {}
+                micLevelAnalyserNode = null;
+            }
+            setMicLevelUI(0);
+        }
+
+        function connectMicLevelMeter() {
+            if (!mediaStream) return;
+            const ctx = ensureAudioContext();
+            if (!ctx) return;
+
+            // 既存があれば作り直す
+            disconnectMicLevelMeter();
 
             try {
-                const perm = await getMicrophonePermissionState();
-                if (perm === 'denied' || perm === 'prompt') {
-                    updateStatus('❌ Microphone permission is required (check your browser site settings)');
-                    return;
-                }
+                micLevelSourceNode = ctx.createMediaStreamSource(mediaStream);
+                micLevelAnalyserNode = ctx.createAnalyser();
+                micLevelAnalyserNode.fftSize = 1024;
+                micLevelAnalyserNode.smoothingTimeConstant = 0.8;
+                micLevelData = new Uint8Array(micLevelAnalyserNode.fftSize);
 
-                // 'unknown' は file:// 等で常に返ることがあるので、以前に許可済みなら復旧を試す
-                if (perm === 'unknown' && localStorage.getItem(MIC_PERMISSION_CACHE_KEY) !== 'true') {
-                    updateStatus('❌ Microphone permission is required (check your browser site settings)');
-                    return;
-                }
+                micLevelSourceNode.connect(micLevelAnalyserNode);
 
-                updateStatus('🔄 Reconnecting microphone...');
-                const ok = await getSelectedMicrophone(false);
-                if (ok) {
-                    micRecoveryDelayMs = 1000;
-                    updateStatus('✅ Microphone reconnected');
-                } else {
-                    micRecoveryDelayMs = Math.min(micRecoveryDelayMs * 2, 10000);
-                }
+                const tick = () => {
+                    if (!micLevelAnalyserNode || !micLevelData) return;
+                    micLevelAnalyserNode.getByteTimeDomainData(micLevelData);
+
+                    // RMS を 0..1 に正規化
+                    let sumSq = 0;
+                    for (let i = 0; i < micLevelData.length; i++) {
+                        const v = (micLevelData[i] - 128) / 128;
+                        sumSq += v * v;
+                    }
+                    const rms = Math.sqrt(sumSq / micLevelData.length);
+
+                    // 見やすいよう少し持ち上げ（無音付近を潰しすぎない）
+                    const boosted = Math.min(1, rms * 2.2);
+                    micLevelSmoothed = micLevelSmoothed * 0.85 + boosted * 0.15;
+                    setMicLevelUI(micLevelSmoothed);
+
+                    micLevelRafId = requestAnimationFrame(tick);
+                };
+
+                micLevelRafId = requestAnimationFrame(tick);
+            } catch (e) {
+                console.warn('level-meter接続に失敗:', e);
+                disconnectMicLevelMeter();
+            }
+        }
+
+        async function attemptMicrophoneRecovery() {
+            // 互換性のために関数は残すが、バックグラウンドでの getUserMedia は実行しない。
+            // （許可ポップアップが鬱陶しい、という要件に合わせる）
+            if (micRecoveryInProgress) return;
+            micRecoveryInProgress = true;
+            try {
+                // ここでは復旧しない。Start ボタンでユーザーが明示的に再接続する。
+                return;
             } finally {
                 micRecoveryInProgress = false;
             }
@@ -699,8 +906,14 @@
                 const anyLive = tracks.some(t => t.readyState === 'live');
                 if (anyLive) return;
 
-                // 無音放置等でトラックが終了したケース
-                setTimeout(attemptMicrophoneRecovery, micRecoveryDelayMs);
+                // トラックが終了したケース。
+                // 自動 getUserMedia は行わず、通知だけしてユーザー操作（Start）を促す。
+                disconnectMicLevelMeter();
+                const now = Date.now();
+                if (now - micStreamEndedNotifiedAt > 15000) {
+                    micStreamEndedNotifiedAt = now;
+                    updateStatus('⚠️ Microphone stream ended. Click Start to reconnect.');
+                }
             }, 5000);
         }
 
@@ -1226,7 +1439,7 @@
 
             recognition.onresult = async (event) => {
                 let interimTranscript = '';
-                let finalTranscript = '';
+                const finalChunks = [];
                 let bestConfidence = 0;
                 let bestTranscript = '';
 
@@ -1246,8 +1459,11 @@
                         
                         // 学習機能: 音声パターンを学習
                         learnSpeechPatterns(selectedTranscript);
-                        
-                        finalTranscript += selectedTranscript;
+
+                        finalChunks.push({
+                            text: selectedTranscript,
+                            confidence: selectedConfidence || 0.5
+                        });
                         
                         if (selectedConfidence > bestConfidence) {
                             bestConfidence = selectedConfidence;
@@ -1258,12 +1474,23 @@
                     }
                 }
 
-                currentTranscript = finalTranscript || interimTranscript;
-                
-                if (currentTranscript.trim()) {
-                    // 日本語の特殊処理と学習機能適用
-                    const processedTranscript = processJapaneseTranscript(currentTranscript.trim());
-                    await displaySubtitles(processedTranscript, !finalTranscript, bestConfidence || 0.5);
+                // interim は「薄いプレビュー翻訳」として別枠に表示
+                const interimText = (interimTranscript || '').trim();
+                if (interimText) {
+                    const processedInterim = processJapaneseTranscript(interimText);
+                    showInterimPreview(processedInterim, 0.5);
+                    lastSpeechTime = Date.now();
+                } else {
+                    // interimが空になったときはプレビューを消す（final処理中でもOK）
+                    clearInterimPreview();
+                }
+
+                // final は「順序保証キュー」で翻訳＆表示（追い越し防止）
+                for (const chunk of finalChunks) {
+                    const jp = (chunk.text || '').trim();
+                    if (!jp) continue;
+                    const processedFinal = processJapaneseTranscript(jp);
+                    enqueueFinalSubtitle(processedFinal, chunk.confidence || 0.5);
                     lastSpeechTime = Date.now();
                 }
             };
@@ -1423,9 +1650,9 @@
                 return;
             }
             
-            const micReady = await getSelectedMicrophone(false);
-            if (!micReady) {
-                // 自動処理での再試行ループは許可ポップアップの原因になりやすいので停止
+            // 自動開始は、既にページ内で有効な mediaStream が存在する場合のみ行う
+            if (!mediaStream || !mediaStream.getTracks().some(t => t.readyState === 'live')) {
+                // メディアストリームが確立していない場合は自動開始しない（ポップアップ抑止）
                 return;
             }
 
@@ -1980,6 +2207,9 @@
             // 「ユーザーが継続を希望」している状態として先に立てる
             isRecognizing = true;
 
+            // 新しいセッションとして古い翻訳処理を無効化
+            finalQueueSessionId++;
+
             // 選択されたマイクを取得
             const micReady = await getSelectedMicrophone(true);
             if (!micReady) {
@@ -2005,6 +2235,7 @@
                     try { await ctx.resume(); } catch {}
                 }
                 tryConnectMicKeepAlive();
+                connectMicLevelMeter();
 
                 recognitionStartPending = true;
                 recognition.start();
@@ -2023,6 +2254,13 @@
             resetRecognitionRestartBackoff();
             document.getElementById('recordingIndicator').style.display = 'none';
 
+            // 翻訳キュー処理を停止（古い async が UI を触らないように）
+            finalQueueSessionId++;
+            finalTranslateQueue = [];
+
+            // interim プレビューも停止
+            clearInterimPreview();
+
             if (recognition) {
                 try {
                     recognition.stop();
@@ -2030,6 +2268,9 @@
                     console.error('停止エラー:', e);
                 }
             }
+
+            // 認識停止時はいったん 0 に戻す（ストリームは保持される場合がある）
+            disconnectMicLevelMeter();
 
             updateStatus('⏹️ Stopped');
 
@@ -2119,61 +2360,258 @@
         }
 
         async function displaySubtitles(text, isInterim = false, confidence = 0.5) {
+            // 互換用（旧実装）。現在は final/interim をそれぞれ専用レンダリングに寄せる。
+            if (isInterim) {
+                showInterimPreview(text, confidence);
+                return;
+            }
+            enqueueFinalSubtitle(text, confidence);
+        }
+
+        function hideSubtitles() {
+            const finalContainer = document.getElementById('finalContainer');
+            if (finalContainer) finalContainer.classList.add('hidden');
+            document.getElementById('translationIndicator')?.classList.add('hidden');
+            updateOverallSubtitleVisibility();
+        }
+
+        function updateOverallSubtitleVisibility() {
             const container = document.getElementById('subtitleContainer');
+            const previewContainer = document.getElementById('previewContainer');
+            const finalContainer = document.getElementById('finalContainer');
+
+            const previewVisible = previewContainer && !previewContainer.classList.contains('hidden');
+            const finalVisible = finalContainer && !finalContainer.classList.contains('hidden');
+
+            if (!container) return;
+            if (previewVisible || finalVisible) {
+                container.style.display = 'block';
+                container.classList.remove('hidden');
+            } else {
+                container.style.display = 'none';
+                container.classList.add('hidden');
+            }
+        }
+
+        function setFinalTranslationIndicatorVisible(visible) {
+            const indicator = document.getElementById('translationIndicator');
+            if (!indicator) return;
+            if (visible) indicator.classList.remove('hidden');
+            else indicator.classList.add('hidden');
+        }
+
+        function setPreviewTranslationIndicatorVisible(visible) {
+            const indicator = document.getElementById('previewTranslationIndicator');
+            if (!indicator) return;
+            if (visible) indicator.classList.remove('hidden');
+            else indicator.classList.add('hidden');
+        }
+
+        function renderPreviewSubtitles() {
+            const previewContainer = document.getElementById('previewContainer');
+            const jpEl = document.getElementById('previewJp');
+            const enEl = document.getElementById('previewEn');
+            const showJp = document.getElementById('showJapanese').checked;
+            const showEn = document.getElementById('showEnglish').checked;
+            const autoTranslate = document.getElementById('autoTranslate')?.checked;
+
+            if (!previewContainer || !jpEl || !enEl) return;
+
+            if (!lastPreview.jp) {
+                previewContainer.classList.add('hidden');
+                setPreviewTranslationIndicatorVisible(false);
+                updateOverallSubtitleVisibility();
+                return;
+            }
+
+            previewContainer.classList.remove('hidden');
+
+            if (showJp) {
+                jpEl.textContent = lastPreview.jp;
+                jpEl.className = 'subtitle-jp interim';
+                jpEl.style.display = 'block';
+            } else {
+                jpEl.style.display = 'none';
+            }
+
+            if (showEn && autoTranslate && lastPreview.en) {
+                enEl.textContent = lastPreview.en;
+                enEl.className = 'subtitle-en interim';
+                enEl.style.display = 'block';
+            } else {
+                enEl.style.display = 'none';
+            }
+
+            updateOverallSubtitleVisibility();
+        }
+
+        function renderFinalSubtitles() {
+            const finalContainer = document.getElementById('finalContainer');
             const jpSubtitle = document.getElementById('subtitleJp');
             const enSubtitle = document.getElementById('subtitleEn');
-            const translationIndicator = document.getElementById('translationIndicator');
             const confidenceBar = document.getElementById('confidenceBar');
             const showJp = document.getElementById('showJapanese').checked;
             const showEn = document.getElementById('showEnglish').checked;
             const autoTranslate = document.getElementById('autoTranslate')?.checked;
 
+            if (!finalContainer || !jpSubtitle || !enSubtitle) return;
+
+            if (!lastFinal.jp) {
+                finalContainer.classList.add('hidden');
+                setFinalTranslationIndicatorVisible(false);
+                updateOverallSubtitleVisibility();
+                return;
+            }
+
+            finalContainer.classList.remove('hidden');
+
             // 信頼度バー
             if (confidenceBar) {
-                const clamped = Math.max(0, Math.min(1, Number(confidence) || 0));
+                const clamped = Math.max(0, Math.min(1, Number(lastFinal.confidence) || 0));
                 confidenceBar.style.width = (clamped * 100) + '%';
             }
 
             if (showJp) {
-                jpSubtitle.textContent = text;
-                jpSubtitle.className = isInterim ? 'subtitle-jp interim' : 'subtitle-jp final';
+                jpSubtitle.textContent = lastFinal.jp;
+                jpSubtitle.className = 'subtitle-jp final';
                 jpSubtitle.style.display = 'block';
             } else {
                 jpSubtitle.style.display = 'none';
             }
 
-            if (showEn && autoTranslate && !isInterim) {
-                if (translationIndicator) translationIndicator.classList.remove('hidden');
-
-                const seq = ++translationRequestSeq;
-                const translated = await translateUnified(text);
-                if (seq !== translationRequestSeq) {
-                    return; // 古い結果は捨てる
-                }
-
-                enSubtitle.textContent = translated;
+            if (showEn && autoTranslate && lastFinal.en) {
+                enSubtitle.textContent = lastFinal.en;
+                enSubtitle.className = 'subtitle-en final';
                 enSubtitle.style.display = 'block';
-
-                if (translationIndicator) translationIndicator.classList.add('hidden');
             } else {
                 enSubtitle.style.display = 'none';
-                if (translationIndicator) translationIndicator.classList.add('hidden');
             }
 
-            container.style.display = 'block';
-            container.classList.remove('hidden');
+            updateOverallSubtitleVisibility();
+        }
 
-            // 自動非表示のタイマー
-            if (!isInterim) {
-                clearTimeout(hideTimeout);
-                const duration = parseInt(document.getElementById('maxDurationRange').value) * 1000;
-                hideTimeout = setTimeout(hideSubtitles, duration);
+        function clearInterimPreview() {
+            lastPreview.jp = '';
+            lastPreview.en = '';
+            lastPreview.confidence = 0.5;
+            if (previewDebounceTimer) {
+                clearTimeout(previewDebounceTimer);
+                previewDebounceTimer = null;
+            }
+            previewTranslationSeq++;
+            setPreviewTranslationIndicatorVisible(false);
+            renderPreviewSubtitles();
+        }
+
+        function showInterimPreview(jpText, confidence = 0.5) {
+            const trimmed = (jpText || '').trim();
+            if (!trimmed) {
+                clearInterimPreview();
+                return;
+            }
+
+            lastPreview.jp = trimmed;
+            lastPreview.confidence = confidence;
+            // interim はまず日本語を即時表示
+            renderPreviewSubtitles();
+
+            const showEn = document.getElementById('showEnglish').checked;
+            const autoTranslate = document.getElementById('autoTranslate')?.checked;
+            if (!showEn || !autoTranslate) {
+                lastPreview.en = '';
+                setPreviewTranslationIndicatorVisible(false);
+                renderPreviewSubtitles();
+                return;
+            }
+
+            if (previewDebounceTimer) {
+                clearTimeout(previewDebounceTimer);
+            }
+
+            const mySeq = ++previewTranslationSeq;
+            setPreviewTranslationIndicatorVisible(true);
+            previewDebounceTimer = setTimeout(async () => {
+                try {
+                    const targetLang = document.getElementById('targetLanguageSelect')?.value || 'en';
+                    const translated = await translateWithGoogle(trimmed, targetLang);
+                    if (mySeq !== previewTranslationSeq) return;
+                    lastPreview.en = translated;
+                } catch (e) {
+                    // 失敗時はプレビュー翻訳なしで継続
+                    if (mySeq !== previewTranslationSeq) return;
+                    lastPreview.en = '';
+                } finally {
+                    if (mySeq === previewTranslationSeq) {
+                        setPreviewTranslationIndicatorVisible(false);
+                        renderPreviewSubtitles();
+                        // プレビューの表示タイマーをリセット
+                        if (previewHideTimer) {
+                            clearTimeout(previewHideTimer);
+                            previewHideTimer = null;
+                        }
+                        previewHideTimer = setTimeout(() => {
+                            // 自動でプレビューテキストを消す
+                            clearInterimPreview();
+                        }, previewDisplaySec * 1000);
+                    }
+                }
+            }, previewDebounceMs);
+        }
+
+        function enqueueFinalSubtitle(jpText, confidence = 0.5) {
+            const trimmed = (jpText || '').trim();
+            if (!trimmed) return;
+            finalTranslateQueue.push({ jp: trimmed, confidence: confidence || 0.5 });
+            void processFinalTranslateQueue();
+        }
+
+        async function processFinalTranslateQueue() {
+            if (finalQueueProcessing) return;
+            finalQueueProcessing = true;
+            const sessionId = finalQueueSessionId;
+
+            try {
+                while (finalTranslateQueue.length > 0) {
+                    if (sessionId !== finalQueueSessionId) return;
+
+                    const item = finalTranslateQueue.shift();
+                    if (!item || !item.jp) continue;
+
+                    lastFinal.jp = item.jp;
+                    lastFinal.en = '';
+                    lastFinal.confidence = item.confidence || 0.5;
+
+                    // finalの日本語を先に出して「翻訳中」を表示（次のfinalへは進まない）
+                    setFinalTranslationIndicatorVisible(true);
+                    renderFinalSubtitles();
+
+                    const showEn = document.getElementById('showEnglish').checked;
+                    const autoTranslate = document.getElementById('autoTranslate')?.checked;
+
+                    if (showEn && autoTranslate) {
+                        const translated = await translateUnified(item.jp);
+                        if (sessionId !== finalQueueSessionId) return;
+                        lastFinal.en = translated;
+                    } else {
+                        lastFinal.en = '';
+                    }
+
+                    setFinalTranslationIndicatorVisible(false);
+                    renderFinalSubtitles();
+
+                    // 自動非表示のタイマー（finalのみ）
+                    clearTimeout(hideTimeout);
+                    const duration = parseInt(document.getElementById('maxDurationRange').value) * 1000;
+                    hideTimeout = setTimeout(hideSubtitles, duration);
+                }
+            } finally {
+                finalQueueProcessing = false;
             }
         }
 
-        function hideSubtitles() {
-            document.getElementById('subtitleContainer').style.display = 'none';
-            document.getElementById('translationIndicator')?.classList.add('hidden');
+        function rerenderAllSubtitles() {
+            renderPreviewSubtitles();
+            renderFinalSubtitles();
         }
 
         function updateStatus(message) {
@@ -2187,27 +2625,36 @@
         // フォントサイズの調整
         document.getElementById('fontSizeRange').addEventListener('input', (e) => {
             const size = e.target.value;
-            document.querySelector('.subtitle-jp').style.fontSize = size + 'px';
-            document.querySelector('.subtitle-en').style.fontSize = (size * 0.85) + 'px';
+
+            // final
+            const finalJp = document.getElementById('subtitleJp');
+            const finalEn = document.getElementById('subtitleEn');
+            if (finalJp) finalJp.style.fontSize = size + 'px';
+            if (finalEn) finalEn.style.fontSize = (size * 0.85) + 'px';
+
+            // preview（少し小さめ）
+            const previewJp = document.getElementById('previewJp');
+            const previewEn = document.getElementById('previewEn');
+            const previewSize = Math.max(12, Math.round(Number(size) * 0.75));
+            if (previewJp) previewJp.style.fontSize = previewSize + 'px';
+            if (previewEn) previewEn.style.fontSize = Math.max(11, Math.round(previewSize * 0.85)) + 'px';
         });
 
         // チェックボックスの変更時
         document.getElementById('showJapanese').addEventListener('change', () => {
-            if (currentTranscript) {
-                displaySubtitles(currentTranscript);
-            }
+            rerenderAllSubtitles();
         });
 
         document.getElementById('showEnglish').addEventListener('change', () => {
-            if (currentTranscript) {
-                displaySubtitles(currentTranscript);
-            }
+            rerenderAllSubtitles();
         });
 
         document.getElementById('autoTranslate').addEventListener('change', () => {
-            if (currentTranscript) {
-                displaySubtitles(currentTranscript);
+            // プレビュー翻訳も含めて再描画（プレビューは必要なら再翻訳をスケジュール）
+            if (lastPreview.jp) {
+                showInterimPreview(lastPreview.jp, lastPreview.confidence);
             }
+            rerenderAllSubtitles();
         });
 
         // 言語変更時
@@ -2220,6 +2667,11 @@
 
         // マイク変更時
         document.getElementById('microphoneSelect').addEventListener('change', async () => {
+            // 選択を保存（次回ロード時に復元）
+            try {
+                localStorage.setItem(MIC_SELECTED_DEVICE_ID_KEY, document.getElementById('microphoneSelect').value);
+            } catch {}
+
             if (isRecognizing) {
                 isRecognizing = false;
                 if (recognition) {
@@ -2231,7 +2683,8 @@
                     await autoStartRecognition();
                 }, 500);
             } else {
-                // 認識中でない場合は、マイクの準備だけ行う
+                // 認識中でない場合は、ユーザーによる明示操作としてマイク取得を行う
+                //（選択変更はユーザー操作なので true を渡す）
                 await getSelectedMicrophone(true);
             }
         });
@@ -2298,6 +2751,72 @@
             
             // 自動で音声認識を開始
             setTimeout(autoStartRecognition, 1000);
+            // Restore persisted display settings
+            try {
+                const savedMax = localStorage.getItem('maxDisplaySec');
+                const maxEl = document.getElementById('maxDurationRange');
+                if (savedMax && maxEl) {
+                    maxEl.value = savedMax;
+                }
+
+                const previewDeb = localStorage.getItem('previewDebounceMs');
+                const previewDebEl = document.getElementById('previewDebounceRange');
+                const previewDebVal = document.getElementById('previewDebounceValue');
+                if (previewDeb && previewDebEl) {
+                    previewDebEl.value = previewDeb;
+                    previewDebounceMs = Number(previewDeb) || previewDebounceMs;
+                }
+                if (previewDebVal) previewDebVal.textContent = String(previewDebounceMs);
+
+                const previewDur = localStorage.getItem('previewDisplaySec');
+                const previewDurEl = document.getElementById('previewDurationRange');
+                const previewDurVal = document.getElementById('previewDurationValue');
+                if (previewDur && previewDurEl) {
+                    previewDurEl.value = previewDur;
+                    previewDisplaySec = Number(previewDur) || previewDisplaySec;
+                }
+                if (previewDurVal) previewDurVal.textContent = String(previewDisplaySec);
+
+                // Wire change handlers
+                if (maxEl) {
+                    maxEl.addEventListener('input', (e) => {
+                        const v = Number(e.target.value || 8);
+                        try { localStorage.setItem('maxDisplaySec', String(v)); } catch {}
+                        // Apply immediately to current final hide timer
+                        if (hideTimeout) {
+                            clearTimeout(hideTimeout);
+                            hideTimeout = setTimeout(hideSubtitles, v * 1000);
+                        }
+                    });
+                }
+
+                if (previewDebEl) {
+                    previewDebEl.addEventListener('input', (e) => {
+                        const v = Number(e.target.value || 350);
+                        previewDebounceMs = v;
+                        try { localStorage.setItem('previewDebounceMs', String(v)); } catch {}
+                        const valEl = document.getElementById('previewDebounceValue');
+                        if (valEl) valEl.textContent = String(v);
+                    });
+                }
+
+                if (previewDurEl) {
+                    previewDurEl.addEventListener('input', (e) => {
+                        const v = Number(e.target.value || 3);
+                        previewDisplaySec = v;
+                        try { localStorage.setItem('previewDisplaySec', String(v)); } catch {}
+                        const valEl = document.getElementById('previewDurationValue');
+                        if (valEl) valEl.textContent = String(v);
+                        // adjust any existing preview hide timer
+                        if (previewHideTimer) {
+                            clearTimeout(previewHideTimer);
+                            previewHideTimer = setTimeout(() => clearInterimPreview(), previewDisplaySec * 1000);
+                        }
+                    });
+                }
+            } catch (e) {
+                console.warn('restore display settings failed', e);
+            }
         });
 
         // ページを離れる時の処理
