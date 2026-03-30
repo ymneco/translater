@@ -1,16 +1,14 @@
 """
 画像スティッチングツール - Image Stitcher
 ===========================================
-複数のスクリーンショットを重複部分を自動検出して
-1枚のPNGに綺麗に合成するツール。
+機能1: HTMLファイルを直接選択 → フルページ画像として保存
+機能2: 複数のスクリーンショットを重複部分を自動検出して1枚のPNGに合成
 
 使い方:
-  1. ツールを起動
-  2. 画像をドラッグ＆ドロップ、またはファイル選択で追加
-  3. リストの順番を上下ボタンで調整（上から下へ合成）
-  4. 「合成して保存」ボタンで1枚のPNGに出力
+  - HTMLから画像化: 「HTML → 画像」ボタンでHTMLファイルを選択
+  - スクショ合成: 画像を追加 → 並べ替え → 「合成して保存」
 
-対応形式: PNG, JPG, JPEG, BMP, TIFF
+対応形式: HTML, PNG, JPG, JPEG, BMP, TIFF
 """
 
 import cv2
@@ -20,7 +18,90 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import os
 import sys
+import tempfile
+import subprocess
 from pathlib import Path
+
+
+# ============================================================
+#  HTML → 画像変換エンジン
+# ============================================================
+
+class HtmlRenderer:
+    """HTMLファイルをヘッドレスブラウザでフルページ画像に変換する"""
+
+    @staticmethod
+    def check_playwright() -> tuple[bool, str]:
+        """Playwrightとブラウザの利用可否を確認"""
+        try:
+            from playwright.sync_api import sync_playwright
+            return True, "OK"
+        except ImportError:
+            return False, "playwright未インストール: pip install playwright"
+
+    @staticmethod
+    def render_html_to_png(html_path: str, output_path: str,
+                           width: int = 1200,
+                           progress_callback=None) -> dict:
+        """
+        HTMLファイルをフルページPNGに変換する。
+
+        Args:
+            html_path: HTMLファイルのパス
+            output_path: 出力PNGファイルのパス
+            width: ビューポート幅 (px)
+            progress_callback: (message: str) を受け取る関数
+
+        Returns:
+            {"width": int, "height": int, "path": str}
+        """
+        from playwright.sync_api import sync_playwright
+
+        if progress_callback:
+            progress_callback("ブラウザを起動中...")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": width, "height": 800})
+
+            if progress_callback:
+                progress_callback("HTMLファイルを読み込み中...")
+
+            file_url = Path(html_path).resolve().as_uri()
+            page.goto(file_url, wait_until="networkidle")
+
+            # ページの実際のサイズを取得
+            page.wait_for_timeout(500)
+
+            if progress_callback:
+                progress_callback("フルページスクリーンショットを撮影中...")
+
+            page.screenshot(path=output_path, full_page=True)
+
+            # サイズを取得
+            dimensions = page.evaluate("""() => {
+                return {
+                    width: Math.max(
+                        document.body.scrollWidth,
+                        document.documentElement.scrollWidth
+                    ),
+                    height: Math.max(
+                        document.body.scrollHeight,
+                        document.documentElement.scrollHeight
+                    )
+                }
+            }""")
+
+            browser.close()
+
+            if progress_callback:
+                progress_callback("完了")
+
+            return {
+                "width": dimensions["width"],
+                "height": dimensions["height"],
+                "path": output_path
+            }
 
 
 # ============================================================
@@ -331,6 +412,24 @@ class StitcherApp:
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
 
+        # --- HTML → 画像変換 (目立つボタン) ---
+        html_frame = ttk.LabelFrame(btn_frame, text=" HTML → 画像 ")
+        html_frame.pack(fill=tk.X, pady=(0, 15))
+        self.html_btn = ttk.Button(
+            html_frame, text="🌐 HTMLファイルを画像化",
+            style="Small.TButton",
+            command=self._html_to_image)
+        self.html_btn.pack(fill=tk.X, padx=4, pady=(4, 2))
+        # 幅設定
+        self._html_width_var = tk.StringVar(value="1200")
+        w_row = ttk.Frame(html_frame)
+        w_row.pack(fill=tk.X, padx=4, pady=(0, 4))
+        tk.Label(w_row, text="幅:", font=("Meiryo UI", 8)).pack(side=tk.LEFT)
+        ttk.Entry(w_row, textvariable=self._html_width_var,
+                  width=6, font=("Meiryo UI", 8)).pack(side=tk.LEFT, padx=2)
+        tk.Label(w_row, text="px", font=("Meiryo UI", 8)).pack(side=tk.LEFT)
+
+        # --- 画像スティッチング用 ---
         ttk.Button(btn_frame, text="📂 ファイル追加",
                    style="Small.TButton",
                    command=self._add_files).pack(fill=tk.X, pady=(0, 5))
@@ -482,6 +581,86 @@ class StitcherApp:
     def _clear_all(self):
         self.image_paths.clear()
         self._refresh_listbox()
+
+    # ----------------------------------------------------------
+    #  HTML → 画像変換
+    # ----------------------------------------------------------
+
+    def _html_to_image(self):
+        """HTMLファイルを選択してフルページPNGに変換する"""
+        # Playwright確認
+        ok, msg = HtmlRenderer.check_playwright()
+        if not ok:
+            messagebox.showerror("エラー", f"HTML画像化に必要な環境がありません:\n{msg}")
+            return
+
+        # HTMLファイル選択
+        html_path = filedialog.askopenfilename(
+            title="HTMLファイルを選択",
+            filetypes=[
+                ("HTMLファイル", "*.html *.htm"),
+                ("全てのファイル", "*.*")
+            ]
+        )
+        if not html_path:
+            return
+
+        # 保存先選択
+        stem = Path(html_path).stem
+        save_path = filedialog.asksaveasfilename(
+            title="画像の保存先",
+            defaultextension=".png",
+            filetypes=[("PNG画像", "*.png")],
+            initialfile=f"{stem}.png"
+        )
+        if not save_path:
+            return
+
+        # 幅取得
+        try:
+            width = int(self._html_width_var.get())
+            if width < 100 or width > 10000:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("警告", "幅は100〜10000の整数で指定してください。")
+            return
+
+        self.html_btn.config(state="disabled")
+        self.progress["value"] = 0
+        self.progress["maximum"] = 3
+        self.root.update()
+
+        try:
+            step = [0]
+
+            def on_progress(message):
+                step[0] += 1
+                self.progress["value"] = step[0]
+                self.status_label.config(text=f"🌐 {message}")
+                self.root.update()
+
+            result = HtmlRenderer.render_html_to_png(
+                html_path, save_path, width, on_progress)
+
+            self.progress["value"] = self.progress["maximum"]
+            self.status_label.config(
+                text=f"✅ HTML画像化完了: {Path(save_path).name}")
+
+            messagebox.showinfo(
+                "HTML画像化完了",
+                f"HTMLファイルを画像化しました。\n\n"
+                f"入力: {Path(html_path).name}\n"
+                f"出力: {save_path}\n"
+                f"サイズ: {result['width']} x {result['height']} px\n\n"
+                f"手動スクショ不要で、正確な1枚の画像が生成されます。"
+            )
+
+        except Exception as e:
+            messagebox.showerror("エラー", f"HTML画像化に失敗:\n{e}")
+            self.status_label.config(text="❌ HTML画像化エラー")
+
+        finally:
+            self.html_btn.config(state="normal")
 
     # ----------------------------------------------------------
     #  並べ替え機能
